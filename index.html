@@ -1,0 +1,1230 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+  <title>Monitoring KPI Zmian</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #181818; }
+    #root { min-height: 100vh; }
+    .loading-screen {
+      min-height: 100vh; background: #181818; display: flex;
+      flex-direction: column; align-items: center; justify-content: center;
+      gap: 16px; font-family: sans-serif;
+    }
+    .loading-m {
+      width: 60px; height: 60px; background: #FFC72C; border-radius: 16px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 34px; font-weight: 800; color: #111;
+    }
+    .loading-txt { color: #888; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div id="root">
+    <div class="loading-screen">
+      <div class="loading-m">M</div>
+      <p class="loading-txt">Ładowanie…</p>
+    </div>
+  </div>
+
+  <script type="text/babel">
+    const { useState, useEffect } = React;
+
+
+const RESTAURANTS = [
+  { id: "268", name: "Galeria Bałtycka", kr: "Adrian" },
+  { id: "654", name: "Kokoszki / Kartuska", kr: "Alina" },
+  { id: "777", name: "Szczęśliwa", kr: "Justyna" },
+];
+const SHIFTS = [
+  { id: "kz1", label: "KZ1" },
+  { id: "kz2", label: "KZ2" },
+  { id: "nocka", label: "Nocka" },
+];
+// A KPI definition now has a `goals` matrix: { default, byDay: {0..6}, byShift: {kz1,kz2,nocka} }
+// Priority: byDay+byShift (exact) > byDay > byShift > default
+const DEFAULT_KPIS = [
+  { key: "r2p",  label: "R2P",                unit: "sek", lowerBetter: true,  goal: 90,  goals: {} },
+  { key: "ope",  label: "OPE",                unit: "%",   lowerBetter: false, goal: 95,  goals: {} },
+  { key: "pmfy", label: "PMfy",               unit: "%",   lowerBetter: false, goal: 90,  goals: {} },
+  { key: "medJ", label: "Medallia Jakość",    unit: "pkt", lowerBetter: false, goal: 80,  goals: {} },
+  { key: "medG", label: "Medallia Gościnność",unit: "pkt", lowerBetter: false, goal: 80,  goals: {} },
+];
+
+const DOW_LABELS = ["Niedz","Pon","Wt","Śr","Czw","Pt","Sob"];
+const DOW_FULL   = ["Niedziela","Poniedziałek","Wtorek","Środa","Czwartek","Piątek","Sobota"];
+
+// Resolve the effective goal for a KPI given date (YYYY-MM-DD) and shiftId
+function resolveGoal(kpi, date, shiftId) {
+  const g = kpi.goals || {};
+  const dow = new Date(date + "T12:00:00").getDay(); // 0=Sun..6=Sat
+  const dsKey = `${dow}:${shiftId}`;
+  if (g[dsKey]  !== undefined) return Number(g[dsKey]);
+  if (g[dow]    !== undefined) return Number(g[dow]);
+  if (g[shiftId]!== undefined) return Number(g[shiftId]);
+  return Number(kpi.goal);
+}
+const PASS_THRESHOLD = 0.8;
+const ADMIN_PIN = "1234";
+
+function checkKpiRaw(lowerBetter, goal, value) {
+  if (value === "" || value === undefined || value === null) return null;
+  return lowerBetter ? Number(value) <= Number(goal) : Number(value) >= Number(goal);
+}
+function checkKpi(kpi, value) { return checkKpiRaw(kpi.lowerBetter, kpi.goal, value); }
+function today() { return new Date().toISOString().slice(0, 10); }
+function getMonthKey(d) { return d.slice(0, 7); }
+function formatDate(d) { if (!d) return ""; const [y,m,day] = d.split("-"); return `${day}.${m}.${y}`; }
+function uid() { return Math.random().toString(36).slice(2, 8); }
+
+// ── Google Sheets backend (JSONP — omits CORS completely) ─────────────────────
+const GAS_URL = "https://script.google.com/macros/s/AKfycbzkns79loHY-VD4d1lXavnw9q3FrXx1DtgNqITe5TXEVgIbJgkNtHuR7diHQKga4aNSXQ/exec";
+const _cache = {};
+const _syncCache = {};
+let _cbIdx = 0;
+
+// JSONP call — injects a <script> tag, bypasses CORS entirely
+function gasJsonp(params) {
+  return new Promise((resolve) => {
+    const cbName = `_gasCb${_cbIdx++}`;
+    const timer = setTimeout(() => {
+      delete window[cbName];
+      if (s.parentNode) s.parentNode.removeChild(s);
+      resolve({ error: "timeout" });
+    }, 12000);
+    window[cbName] = (data) => {
+      clearTimeout(timer);
+      delete window[cbName];
+      if (s.parentNode) s.parentNode.removeChild(s);
+      resolve(data);
+    };
+    const qs = Object.entries({ ...params, callback: cbName })
+      .map(([k,v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");
+    const s = document.createElement("script");
+    s.src = `${GAS_URL}?${qs}`;
+    s.onerror = () => { clearTimeout(timer); delete window[cbName]; resolve({ error: "script error" }); };
+    document.head.appendChild(s);
+  });
+}
+
+async function lsGet(key) {
+  if (_cache[key] !== undefined) return _cache[key];
+  try {
+    const d = await gasJsonp({ action: "get", key });
+    const val = (d.value !== null && d.value !== undefined) ? JSON.parse(d.value) : null;
+    _cache[key] = val;
+    return val;
+  } catch { return null; }
+}
+async function lsSet(key, val) {
+  _cache[key] = val;
+  _syncCache[key] = val;
+  try {
+    const b64 = btoa(unescape(encodeURIComponent(JSON.stringify(val))));
+    const d = await gasJsonp({ action: "set", key, value: b64, encoding: "base64" });
+    return !!d.ok;
+  } catch { return false; }
+}
+async function lsDel(key) {
+  delete _cache[key];
+  delete _syncCache[key];
+  try { await gasJsonp({ action: "delete", key }); } catch {}
+}
+function lsGetSync(key) { return _syncCache[key] ?? null; }
+function lsSetSync(key, val) { _syncCache[key] = val; _cache[key] = val; lsSet(key, val); }
+
+async function preloadConfig(restIds) {
+  await Promise.all(restIds.flatMap(id => [
+    lsGet(`managers:${id}`).then(v => { if(v) _syncCache[`managers:${id}`] = v; }),
+    lsGet(`kpis:${id}`).then(v => { if(v) _syncCache[`kpis:${id}`] = v; }),
+  ]));
+}
+
+function getManagers(restId) { return lsGetSync(`managers:${restId}`) || []; }
+function saveManagers(restId, list) { lsSetSync(`managers:${restId}`, list); }
+
+async function getMonthShifts(restId, monthKey) {
+  const idx = await lsGet(`idx:${restId}:${monthKey}`) || [];
+  const records = await Promise.all(idx.map(entry => {
+    const pipe = entry.indexOf("|");
+    return lsGet(`shift:${restId}:${entry.slice(0,pipe)}:${entry.slice(pipe+1)}`);
+  }));
+  return records.filter(Boolean);
+}
+
+function getManagerStats(shifts, managerId) {
+  const ms = shifts.filter(r => r.managerId === managerId);
+  const totalKpiChecks = ms.reduce((s,r) => s + (r.totalKpis || Object.keys(r.results).length), 0);
+  const totalPassed = ms.reduce((s,r) => s + r.passedCount, 0);
+  const passRate = totalKpiChecks > 0 ? totalPassed / totalKpiChecks : 0;
+  return { shifts: ms, total: ms.length, totalKpiChecks, totalPassed, passRate, bonus: passRate >= PASS_THRESHOLD };
+}
+
+// ── Home ──────────────────────────────────────────────────────────────────────
+function HomeView({ onNav }) {
+  return (
+    <div className="home-view">
+      <div className="logo-block">
+        <div className="logo-m">M</div>
+        <div className="logo-text">
+          <span className="logo-title">Monitoring</span>
+          <span className="logo-sub">KPI Zmian</span>
+        </div>
+      </div>
+      <p className="home-desc">Wybierz swoją rolę, aby kontynuować.</p>
+      <div className="home-cards">
+        <button className="home-card primary" onClick={() => onNav("shift-select")}>
+          <span className="card-icon">📋</span>
+          <div><span className="card-label">Wpisz wyniki zmiany</span><span className="card-hint">Kierownik Zmiany</span></div>
+        </button>
+        <button className="home-card secondary" onClick={() => onNav("admin-login")}>
+          <span className="card-icon">📊</span>
+          <div><span className="card-label">Panel raportów</span><span className="card-hint">KR / Franczyzobiorca</span></div>
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Shift Select ──────────────────────────────────────────────────────────────
+function ShiftSelectView({ onNav }) {
+  const [rest, setRest] = useState("");
+  const [managerId, setManagerId] = useState("");
+  const [shift, setShift] = useState("");
+  const [date, setDate] = useState(today());
+  const managers = rest ? getManagers(rest).filter(m => m.active) : [];
+  const canGo = rest && managerId && shift && date;
+  return (
+    <div className="form-view">
+      <button className="back-btn" onClick={() => onNav("home")}>← Powrót</button>
+      <h2 className="form-title">Identyfikacja zmiany</h2>
+      <div className="field"><label>Restauracja</label>
+        <div className="radio-group">
+          {RESTAURANTS.map(r => (
+            <button key={r.id} className={`radio-btn ${rest===r.id?"active":""}`}
+              onClick={() => { setRest(r.id); setManagerId(""); }}>{r.name}</button>
+          ))}
+        </div>
+      </div>
+      {rest && (
+        <div className="field"><label>Kierownik Zmiany</label>
+          {managers.length === 0
+            ? <div className="empty-info"><span>Brak KZ. Administrator musi dodać KZ w panelu.</span></div>
+            : <select value={managerId} onChange={e=>setManagerId(e.target.value)} className="text-input sel">
+                <option value="">— Wybierz KZ —</option>
+                {managers.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+              </select>
+          }
+        </div>
+      )}
+      <div className="field"><label>Zmiana</label>
+        <div className="radio-group horiz">
+          {SHIFTS.map(s => (
+            <button key={s.id} className={`radio-btn ${shift===s.id?"active":""}`}
+              onClick={() => setShift(s.id)}>{s.label}</button>
+          ))}
+        </div>
+      </div>
+      <div className="field"><label>Data</label>
+        <input type="date" value={date} max={today()} onChange={e=>setDate(e.target.value)} className="text-input" />
+      </div>
+      <button className="btn-primary" disabled={!canGo}
+        onClick={() => onNav("kpi-form", { restId: rest, managerId, shift, date })}>
+        Dalej →
+      </button>
+    </div>
+  );
+}
+
+// ── KPI Form (new + edit) ─────────────────────────────────────────────────────
+function KpiFormView({ params, onNav }) {
+  const { restId, managerId, shift, date, editMode } = params;
+  const rest = RESTAURANTS.find(r=>r.id===restId);
+  const shiftObj = SHIFTS.find(s=>s.id===shift);
+  const managers = getManagers(restId);
+  const manager = managers.find(m=>m.id===managerId);
+
+  const shiftKey = `shift:${restId}:${date}:${shift}`;
+  const [kpis, setKpis] = useState(lsGetSync(`kpis:${restId}`) || DEFAULT_KPIS);
+  const [existing, setExisting] = useState(null);
+  const [loadingExisting, setLoadingExisting] = useState(true);
+  const [values, setValues] = useState({});
+  const [saving, setSaving] = useState(false);
+  const [done, setDone] = useState(false);
+  const [saveError, setSaveError] = useState(null);
+
+  useEffect(() => {
+    // Load kpis and existing shift record in parallel
+    Promise.all([
+      lsGet(`kpis:${restId}`),
+      lsGet(shiftKey),
+    ]).then(([storedKpis, ex]) => {
+      if (storedKpis && Array.isArray(storedKpis)) setKpis(storedKpis);
+      setExisting(ex);
+      if (ex) {
+        const init = {};
+        Object.entries(ex.results).forEach(([k,v]) => { init[k] = v.value; });
+        setValues(init);
+      }
+      setLoadingExisting(false);
+    });
+  }, [shiftKey, restId]);
+
+  const blockedByOther = !editMode && existing && existing.managerId !== managerId;
+  const allFilled = kpis.every(k => values[k.key] !== undefined && values[k.key] !== "");
+
+  async function handleSubmit() {
+    setSaving(true); setSaveError(null);
+    const results = {};
+    kpis.forEach(k => {
+      const effectiveGoal = resolveGoal(k, date, shift);
+      const passed = checkKpiRaw(k.lowerBetter, effectiveGoal, values[k.key]);
+      results[k.key] = {
+        label: k.label, unit: k.unit,
+        value: Number(values[k.key]),
+        goal: effectiveGoal,
+        lowerBetter: k.lowerBetter,
+        passed,
+      };
+    });
+    const passedCount = Object.values(results).filter(r=>r.passed).length;
+    const record = {
+      restId, shift, date, managerId, managerName: manager?.name,
+      results, passedCount, totalKpis: kpis.length,
+      savedAt: new Date().toISOString(),
+      editedAt: editMode ? new Date().toISOString() : undefined,
+    };
+    const ok1 = await lsSet(shiftKey, record);
+    const monthKey = getMonthKey(date);
+    const idxKey = `idx:${restId}:${monthKey}`;
+    const idx = await lsGet(idxKey) || [];
+    const entry = `${date}|${shift}`;
+    if (!idx.includes(entry)) { idx.push(entry); await lsSet(idxKey, idx); }
+    setSaving(false);
+    if (!ok1) { setSaveError("Błąd zapisu — sprawdź połączenie z internetem"); return; }
+    setDone(true);
+    setTimeout(() => {
+      if (editMode) onNav("admin-dashboard");
+      else onNav("result", { record });
+    }, 300);
+  }
+
+  if (loadingExisting) return <div className="loading" style={{padding:"60px",textAlign:"center",color:"var(--muted)"}}>Ładowanie…</div>;
+
+  if (blockedByOther) return (
+    <div className="form-view center-msg">
+      <div className="warn-icon">⚠️</div>
+      <h2>Zmiana już zajęta</h2>
+      <p>Ten slot był już wpisany przez innego KZ.</p>
+      <button className="btn-secondary" onClick={()=>onNav("home")}>Powrót</button>
+    </div>
+  );
+
+  return (
+    <div className="form-view">
+      <button className="back-btn" onClick={() => editMode ? onNav("admin-dashboard") : onNav("shift-select")}>← Powrót</button>
+      {editMode && <div className="edit-banner">✏️ Tryb edycji — zmiana zostanie nadpisana</div>}
+      <div className="shift-badge">
+        <span className="badge-rest">{rest?.name}</span>
+        <span className="badge-info">{shiftObj?.label} · {formatDate(date)}</span>
+        <span className="badge-name">{manager?.name}</span>
+      </div>
+      <h2 className="form-title">Wyniki KPI</h2>
+      {kpis.map(k => {
+        const val = values[k.key];
+        const effectiveGoal = resolveGoal(k, date, shift);
+        const passed = checkKpiRaw(k.lowerBetter, effectiveGoal, val);
+        return (
+          <div key={k.key} className={`kpi-row ${passed===true?"pass":passed===false?"fail":""}`}>
+            <div className="kpi-meta">
+              <span className="kpi-label">{k.label}</span>
+              <span className="kpi-goal">{k.lowerBetter?"≤":"≥"}{resolveGoal(k,date,shift)} {k.unit}</span>
+            </div>
+            <div className="kpi-input-wrap">
+              <input type="number" step="0.1" placeholder={k.unit}
+                value={val ?? ""}
+                onChange={e=>setValues(p=>({...p,[k.key]:e.target.value}))}
+                className="kpi-input" />
+              {passed !== null && <span className={`kpi-pill ${passed?"ok":"nok"}`}>{passed?"✓":"✗"}</span>}
+            </div>
+          </div>
+        );
+      })}
+      {saveError && <div className="save-error">{saveError}</div>}
+      <button className="btn-primary mt" disabled={!allFilled||saving||done} onClick={handleSubmit}>
+        {saving ? "Zapisuję..." : done ? "Zapisano ✓" : editMode ? "Zapisz zmiany" : "Zatwierdź zmianę"}
+      </button>
+    </div>
+  );
+}
+
+// ── Result ────────────────────────────────────────────────────────────────────
+function ResultView({ params, onNav }) {
+  const { record } = params;
+  const passed = record.passedCount; const total = record.totalKpis;
+  const color = passed===total?"green":passed>=Math.ceil(total/2)?"yellow":"red";
+  return (
+    <div className="result-view">
+      <div className={`result-circle ${color}`}>
+        <span className="rc-num">{passed}/{total}</span>
+        <span className="rc-label">KPI OK</span>
+      </div>
+      <h2 className="result-heading">{passed===total?"Świetna zmiana! 🏆":passed>=Math.ceil(total/2)?"Dobra robota! 💪":"Wymaga poprawy 📉"}</h2>
+      <p style={{fontSize:"14px",color:"var(--muted)"}}>{record.managerName} · {formatDate(record.date)}</p>
+      <div className="result-kpis">
+        {Object.entries(record.results).map(([key,r]) => (
+          <div key={key} className={`result-row ${r.passed?"pass":"fail"}`}>
+            <span>{r.label}</span><span>{r.value} {r.unit}</span>
+            <span className={`pill ${r.passed?"ok":"nok"}`}>{r.passed?"✓":"✗"}</span>
+          </div>
+        ))}
+      </div>
+      <button className="btn-secondary" onClick={()=>onNav("home")}>Powrót do menu</button>
+    </div>
+  );
+}
+
+// ── Admin Login ───────────────────────────────────────────────────────────────
+function AdminLoginView({ onNav }) {
+  const [pin, setPin] = useState(""); const [err, setErr] = useState(false);
+  function tryLogin() { pin===ADMIN_PIN ? onNav("admin-dashboard") : (setErr(true), setPin("")); }
+  return (
+    <div className="form-view center-msg">
+      <button className="back-btn solo" onClick={()=>onNav("home")}>← Powrót</button>
+      <h2>Panel Raportów</h2><p className="sub">Wpisz PIN dostępu</p>
+      <input type="password" inputMode="numeric" maxLength={6} placeholder="••••" value={pin}
+        onChange={e=>{setPin(e.target.value);setErr(false);}} className="text-input pin-input"
+        onKeyDown={e=>e.key==="Enter"&&tryLogin()} />
+      {err && <p className="error-msg">Nieprawidłowy PIN</p>}
+      <button className="btn-primary" onClick={tryLogin} disabled={!pin}>Zaloguj</button>
+    </div>
+  );
+}
+
+// ── Admin Dashboard ───────────────────────────────────────────────────────────
+function AdminDashboard({ onNav }) {
+  const [tab, setTab] = useState("managers");
+  const [selRest, setSelRest] = useState(RESTAURANTS[0].id);
+  const [selMonth, setSelMonth] = useState(today().slice(0,7));
+  const [detailMgr, setDetailMgr] = useState(null); // manager object for detail view
+
+  const months = [];
+  for(let i=0;i<6;i++){
+    const d=new Date(); d.setMonth(d.getMonth()-i);
+    months.push({value:d.toISOString().slice(0,7), label:d.toLocaleDateString("pl-PL",{month:"long",year:"numeric"})});
+  }
+
+  if (detailMgr) {
+    return <ManagerDetailView
+      manager={detailMgr}
+      restId={selRest}
+      monthKey={selMonth}
+      onBack={() => setDetailMgr(null)}
+      onEdit={(params) => onNav("kpi-form", {...params, editMode: true})}
+    />;
+  }
+
+  return (
+    <div className="admin-view">
+      <div className="admin-header">
+        <h2>Panel Raportów</h2>
+        <button className="btn-ghost sm" onClick={()=>onNav("home")}>← Wyjdź</button>
+      </div>
+      <div className="admin-controls">
+        <div className="seg-ctrl">
+          {RESTAURANTS.map(r=>(
+            <button key={r.id} className={`seg-btn ${selRest===r.id?"active":""}`}
+              onClick={()=>{ setSelRest(r.id); setDetailMgr(null); }}>{r.name.split(" ")[0]}</button>
+          ))}
+        </div>
+        <select value={selMonth} onChange={e=>setSelMonth(e.target.value)} className="month-sel">
+          {months.map(m=><option key={m.value} value={m.value}>{m.label}</option>)}
+        </select>
+      </div>
+      <div className="tab-bar">
+        {[["managers","KZ i premia"],["shifts","Zmiany"],["kpis","Cele KPI"]].map(([t,l])=>(
+          <button key={t} className={`tab ${tab===t?"active":""}`} onClick={()=>setTab(t)}>{l}</button>
+        ))}
+      </div>
+      {tab==="managers" && <ManagersTab restId={selRest} monthKey={selMonth} onDetail={setDetailMgr} />}
+      {tab==="shifts"   && <ShiftsTab   restId={selRest} monthKey={selMonth} onEdit={(p)=>onNav("kpi-form",{...p,editMode:true})} />}
+      {tab==="kpis"     && <KpiConfigTab restId={selRest} />}
+    </div>
+  );
+}
+
+// ── Manager Detail View ───────────────────────────────────────────────────────
+function ManagerDetailView({ manager, restId, monthKey, onBack, onEdit }) {
+  const [refresh, setRefresh] = useState(0);
+  const [allShifts2, setAllShifts2] = useState([]);
+  const [loadingD, setLoadingD] = useState(true);
+  const kpis = lsGetSync(`kpis:${restId}`) || DEFAULT_KPIS;
+
+  useEffect(() => {
+    setLoadingD(true);
+    getMonthShifts(restId, monthKey).then(s => { setAllShifts2(s); setLoadingD(false); });
+  }, [restId, monthKey, refresh]);
+
+  const stats2 = getManagerStats(allShifts2, manager.id);
+  const sorted2 = [...stats2.shifts].sort((a,b) => b.date.localeCompare(a.date));
+
+  async function handleDelete(record) {
+    if (!window.confirm(`Usunąć zmianę ${formatDate(record.date)} ${SHIFTS.find(s=>s.id===record.shift)?.label}?`)) return;
+    const shiftKey = `shift:${restId}:${record.date}:${record.shift}`;
+    await lsDel(shiftKey);
+    const idxKey = `idx:${restId}:${monthKey}`;
+    const idx = await lsGet(idxKey) || [];
+    await lsSet(idxKey, idx.filter(e => e !== `${record.date}|${record.shift}`));
+    setRefresh(r => r+1);
+  }
+
+  return (
+    <div className="admin-view">
+      <div className="admin-header">
+        <button className="btn-ghost" onClick={onBack}>← Powrót</button>
+      </div>
+
+      {loadingD && <div className="loading">Ładowanie danych…</div>}
+      {/* Manager summary */}
+      <div className="mgr-detail-header">
+        <div className="mgr-detail-name">{manager.name}</div>
+        <div className={`bonus-chip ${stats2.bonus?"yes":"no"}`}>
+          {stats2.bonus ? "🏆 Premia" : "❌ Brak premii"}
+        </div>
+      </div>
+      <div className="mc-stats">
+        <div className="mc-stat"><span className="mcs-val">{stats2.total}</span><span className="mcs-lbl">Zmian</span></div>
+        <div className="mc-stat"><span className="mcs-val">{stats2.totalPassed}/{stats2.totalKpiChecks}</span><span className="mcs-lbl">KPI OK</span></div>
+        <div className="mc-stat"><span className={`mcs-val ${stats2.bonus?"green-txt":"red-txt"}`}>{(stats2.passRate*100).toFixed(0)}%</span><span className="mcs-lbl">Zaliczenia</span></div>
+      </div>
+      {stats2.total > 0 && (
+        <div className="mc-bar-wrap">
+          <div className="mc-bar" style={{width:`${stats2.passRate*100}%`,background:stats2.bonus?"var(--green)":"var(--orange)"}} />
+          <div className="mc-bar-threshold" />
+        </div>
+      )}
+
+      {/* Per-KPI breakdown */}
+      {sorted2.length > 0 && (() => {
+        const kpiKeys = [...new Set(sorted2.flatMap(r => Object.keys(r.results)))];
+        return (
+          <>
+            <p className="section-title" style={{marginTop:"4px"}}>Zaliczenia per KPI</p>
+            <div className="kpi-breakdown">
+              {kpiKeys.map(key => {
+                const vals = sorted2.map(r => r.results[key]).filter(Boolean);
+                const passed = vals.filter(v => v.passed).length;
+                const pct = vals.length ? Math.round((passed / vals.length) * 100) : 0;
+                const label = vals[0]?.label || key;
+                const unit = vals[0]?.unit || "";
+                const avg = vals.length ? (vals.reduce((s,v)=>s+v.value,0)/vals.length).toFixed(1) : "–";
+                const good = pct >= 80;
+                return (
+                  <div key={key} className="kpi-bd-row">
+                    <div className="kpi-bd-top">
+                      <span className="kpi-bd-label">{label}</span>
+                      <span className="kpi-bd-right">
+                        <span className="kpi-bd-avg">śr. {avg} {unit}</span>
+                        <span className={`kpi-bd-pct ${good?"green-txt":"red-txt"}`}>{pct}%</span>
+                      </span>
+                    </div>
+                    <div className="kpi-bd-bar-wrap">
+                      <div className="kpi-bd-bar" style={{width:`${pct}%`, background: good?"var(--green)":pct>=50?"var(--orange)":"var(--red)"}} />
+                      <div className="kpi-bd-threshold" />
+                    </div>
+                    <div className="kpi-bd-count">{passed}/{vals.length} zmian</div>
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        );
+      })()}
+
+      {/* Shift history */}
+      <p className="section-title" style={{marginTop:"4px"}}>Historia zmian</p>
+      {sorted2.length === 0 && <div className="empty">Brak zmian w tym miesiącu.</div>}
+
+      {sorted2.map((record, i) => {
+        const shiftLabel = SHIFTS.find(s=>s.id===record.shift)?.label || record.shift;
+        const total = record.totalKpis || Object.keys(record.results).length;
+        return (
+          <div key={i} className="detail-shift-card">
+            {/* Header row */}
+            <div className="dsc-header">
+              <div className="dsc-title">
+                <span className="dsc-date">{formatDate(record.date)}</span>
+                <span className="dsc-shift">{shiftLabel}</span>
+                {record.editedAt && <span className="dsc-edited">edytowano</span>}
+              </div>
+              <div className="dsc-score-row">
+                <span className={`sc-score ${record.passedCount===total?"all":record.passedCount>=Math.ceil(total/2)?"mid":"low"}`}>
+                  {record.passedCount}/{total}
+                </span>
+                <button className="icon-btn sm" title="Edytuj"
+                  onClick={() => onEdit({ restId, managerId: manager.id, shift: record.shift, date: record.date })}>✏️</button>
+                <button className="icon-btn sm danger" title="Usuń"
+                  onClick={() => handleDelete(record)}>🗑</button>
+              </div>
+            </div>
+
+            {/* KPI table rows */}
+            <div className="kpi-table">
+              <div className="kpi-table-head">
+                <span>KPI</span><span>Wynik</span><span>Cel</span><span></span>
+              </div>
+              {Object.entries(record.results).map(([key, res]) => (
+                <div key={key} className="kpi-table-row">
+                  <span className="ktr-label">{res.label}</span>
+                  <span className="ktr-value">{res.value} {res.unit}</span>
+                  <span className="ktr-goal">{res.lowerBetter?"≤":"≥"}{res.goal}</span>
+                  <span className={`ktr-pill ${res.passed?"ok":"nok"}`}>{res.passed?"✓":"✗"}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Managers Tab ──────────────────────────────────────────────────────────────
+function ManagersTab({ restId, monthKey, onDetail }) {
+  const [managers, setManagers] = useState([]);
+  const [newName, setNewName] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [refresh, setRefresh] = useState(0);
+
+  useEffect(() => { setManagers(getManagers(restId)); }, [restId, refresh]);
+
+  const [allShifts, setAllShifts] = useState([]);
+  const [loadingShifts, setLoadingShifts] = useState(true);
+  useEffect(() => {
+    setLoadingShifts(true);
+    getMonthShifts(restId, monthKey).then(s => { setAllShifts(s); setLoadingShifts(false); });
+  }, [restId, monthKey, refresh]);
+
+  function addManager() {
+    if (!newName.trim()) return;
+    const updated = [...managers, { id: uid(), name: newName.trim(), active: true }];
+    saveManagers(restId, updated); setManagers(updated); setNewName(""); setAdding(false);
+  }
+  function toggleActive(id) {
+    const updated = managers.map(m => m.id===id ? {...m, active: !m.active} : m);
+    saveManagers(restId, updated); setManagers(updated);
+  }
+  function removeManager(id) {
+    if (!window.confirm("Usunąć KZ? Historia zmian zostanie.")) return;
+    const updated = managers.filter(m => m.id!==id);
+    saveManagers(restId, updated); setManagers(updated);
+  }
+
+  const active = managers.filter(m=>m.active);
+  const inactive = managers.filter(m=>!m.active);
+
+  const missing = (() => {
+    const now = new Date();
+    const [mYear, mMonth] = monthKey.split("-").map(Number);
+    const isCurrentMonth = now.getFullYear() === mYear && (now.getMonth()+1) === mMonth;
+    const lastDay = isCurrentMonth ? now.getDate() : new Date(mYear, mMonth, 0).getDate();
+    const slots = [];
+    for (let d = 1; d <= lastDay; d++) {
+      const dateStr = `${mYear}-${String(mMonth).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
+      SHIFTS.forEach(s => {
+        if (!allShifts.some(r => r.date === dateStr && r.shift === s.id))
+          slots.push({ date: dateStr, shift: s });
+      });
+    }
+    return slots;
+  })();
+
+  return (
+    <div className="tab-content">
+      {loadingShifts && <div className="loading">Ładowanie danych…</div>}
+      {!loadingShifts && missing.length > 0 && (
+        <div className="missing-block">
+          <div className="missing-header">
+            <span className="missing-icon">⚠️</span>
+            <div>
+              <div className="missing-title">Brakujące dane: {missing.length} zmian</div>
+              <div className="missing-sub">Zmiany bez wpisanych wyników KPI</div>
+            </div>
+          </div>
+          <div className="missing-list">
+            {missing.slice(0, 12).map((item, i) => (
+              <div key={i} className="missing-row">
+                <span className="missing-date">{formatDate(item.date)}</span>
+                <span className="missing-shift-tag">{item.shift.label}</span>
+              </div>
+            ))}
+            {missing.length > 12 && <div className="missing-more">+ {missing.length - 12} więcej</div>}
+          </div>
+        </div>
+      )}
+      {active.length === 0 && !adding && <div className="empty">Brak KZ. Dodaj poniżej.</div>}
+      {active.map(m => {
+        const stats = getManagerStats(allShifts, m.id);
+        return (
+          <div key={m.id} className="manager-card" onClick={() => onDetail(m)} style={{cursor:"pointer"}}>
+            <div className="mc-top">
+              <div className="mc-name">{m.name}</div>
+              <div style={{display:"flex",alignItems:"center",gap:"8px"}}>
+                <div className={`bonus-chip ${stats.bonus?"yes":"no"}`}>{stats.bonus?"🏆 Premia":"❌ Brak"}</div>
+                <span style={{color:"var(--muted)",fontSize:"18px"}}>›</span>
+              </div>
+            </div>
+            <div className="mc-stats" onClick={e=>e.stopPropagation()}>
+              <div className="mc-stat"><span className="mcs-val">{stats.total}</span><span className="mcs-lbl">Zmian</span></div>
+              <div className="mc-stat"><span className="mcs-val">{stats.totalPassed}/{stats.totalKpiChecks}</span><span className="mcs-lbl">KPI OK</span></div>
+              <div className="mc-stat"><span className={`mcs-val ${stats.bonus?"green-txt":"red-txt"}`}>{(stats.passRate*100).toFixed(0)}%</span><span className="mcs-lbl">Zaliczenia</span></div>
+            </div>
+            {stats.total > 0 && (
+              <div className="mc-bar-wrap" onClick={e=>e.stopPropagation()}>
+                <div className="mc-bar" style={{width:`${stats.passRate*100}%`,background:stats.bonus?"var(--green)":"var(--orange)"}} />
+                <div className="mc-bar-threshold" />
+              </div>
+            )}
+            <div className="mc-actions" onClick={e=>e.stopPropagation()}>
+              <button className="icon-btn sm" onClick={()=>toggleActive(m.id)} title="Dezaktywuj">⏸</button>
+              <button className="icon-btn sm danger" onClick={()=>removeManager(m.id)}>🗑</button>
+            </div>
+          </div>
+        );
+      })}
+
+      {adding ? (
+        <div className="add-manager-form">
+          <input className="text-input" placeholder="Imię i nazwisko KZ" value={newName}
+            onChange={e=>setNewName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addManager()} autoFocus />
+          <div style={{display:"flex",gap:"8px"}}>
+            <button className="btn-primary sm" style={{flex:1}} onClick={addManager} disabled={!newName.trim()}>Dodaj</button>
+            <button className="btn-secondary sm" style={{flex:1}} onClick={()=>{setAdding(false);setNewName("");}}>Anuluj</button>
+          </div>
+        </div>
+      ) : (
+        <button className="btn-add-kpi" onClick={()=>setAdding(true)}>+ Dodaj KZ</button>
+      )}
+
+      {inactive.length > 0 && <>
+        <p className="section-title" style={{marginTop:"4px"}}>Nieaktywni</p>
+        {inactive.map(m => (
+          <div key={m.id} className="manager-card inactive">
+            <div className="mc-top">
+              <div className="mc-name muted">{m.name}</div>
+              <div style={{display:"flex",gap:"6px"}}>
+                <button className="icon-btn sm" onClick={()=>toggleActive(m.id)}>▶</button>
+                <button className="icon-btn sm danger" onClick={()=>removeManager(m.id)}>🗑</button>
+              </div>
+            </div>
+          </div>
+        ))}
+      </>}
+    </div>
+  );
+}
+
+// ── Shifts Tab ────────────────────────────────────────────────────────────────
+function ShiftsTab({ restId, monthKey, onEdit }) {
+  const [filterMgr, setFilterMgr] = useState("all");
+  const [refresh, setRefresh] = useState(0);
+
+  const managers = getManagers(restId);
+  const [allShifts, setAllShifts] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    setLoading(true);
+    getMonthShifts(restId, monthKey).then(s => { setAllShifts(s); setLoading(false); });
+  }, [restId, monthKey, refresh]);
+
+  const filtered = (filterMgr==="all" ? allShifts : allShifts.filter(r=>r.managerId===filterMgr))
+    .sort((a,b) => b.date.localeCompare(a.date)||a.shift.localeCompare(b.shift));
+
+  async function handleDelete(record) {
+    if (!window.confirm(`Usunąć zmianę ${formatDate(record.date)}?`)) return;
+    await lsDel(`shift:${restId}:${record.date}:${record.shift}`);
+    const idxKey = `idx:${restId}:${monthKey}`;
+    const idx = await lsGet(idxKey) || [];
+    await lsSet(idxKey, idx.filter(e => e !== `${record.date}|${record.shift}`));
+    setRefresh(r=>r+1);
+  }
+
+  return (
+    <div className="tab-content">
+      <select value={filterMgr} onChange={e=>setFilterMgr(e.target.value)} className="month-sel">
+        <option value="all">Wszyscy KZ</option>
+        {managers.map(m=><option key={m.id} value={m.id}>{m.name}</option>)}
+      </select>
+      {loading ? <div className="loading">Ładowanie…</div> : filtered.length===0 ? <div className="empty">Brak zmian.</div> : filtered.map((r,i)=>{
+        const total=r.totalKpis||Object.keys(r.results).length;
+        const sl=SHIFTS.find(s=>s.id===r.shift)?.label||r.shift;
+        return (
+          <div key={`${r.date}${r.shift}${i}`} className="shift-card">
+            <div className="sc-top">
+              <div>
+                <span className="sc-date">{formatDate(r.date)} · <strong>{sl}</strong></span>
+                {r.editedAt && <span className="dsc-edited" style={{marginLeft:"8px"}}>edytowano</span>}
+              </div>
+              <div style={{display:"flex",alignItems:"center",gap:"6px"}}>
+                <span className={`sc-score ${r.passedCount===total?"all":r.passedCount>=Math.ceil(total/2)?"mid":"low"}`}>{r.passedCount}/{total}</span>
+                <button className="icon-btn sm" onClick={()=>onEdit({restId, managerId:r.managerId, shift:r.shift, date:r.date})}>✏️</button>
+                <button className="icon-btn sm danger" onClick={()=>handleDelete(r)}>🗑</button>
+              </div>
+            </div>
+            <div className="sc-name">{r.managerName||"—"}</div>
+            <div className="sc-kpis">
+              {Object.entries(r.results).map(([key,res])=>(
+                <span key={key} className={`sc-kpi-pill ${res.passed?"ok":"nok"}`}>{res.label}: {res.value} {res.unit}</span>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── KPI Config Tab ────────────────────────────────────────────────────────────
+function KpiConfigTab({ restId }) {
+  const [kpis, setKpis] = useState([]);
+  const [saved, setSaved] = useState(false);
+  const [editingIdx, setEditingIdx] = useState(null);
+  const [adding, setAdding] = useState(false);
+  const [draft, setDraft] = useState({});
+  const [expandedGoals, setExpandedGoals] = useState(null); // index of KPI with open goal matrix
+
+  useEffect(() => {
+    const stored = lsGetSync(`kpis:${restId}`);
+    setKpis(stored || DEFAULT_KPIS.map(k=>({...k, goals: k.goals||{}})));
+    setEditingIdx(null); setAdding(false); setExpandedGoals(null);
+    lsGet(`kpis:${restId}`).then(v => { if(v) { _syncCache[`kpis:${restId}`] = v; setKpis(v); } });
+  }, [restId]);
+
+  function saveAll(nk) { lsSetSync(`kpis:${restId}`,nk); setKpis(nk); setSaved(true); setTimeout(()=>setSaved(false),2000); }
+  function startEdit(i) { setDraft({...kpis[i], goals: kpis[i].goals||{}}); setEditingIdx(i); setAdding(false); setExpandedGoals(null); }
+  function startAdd() { setDraft({key:uid(),label:"",unit:"",lowerBetter:false,goal:"",goals:{}}); setAdding(true); setEditingIdx(null); setExpandedGoals(null); }
+  function cancel() { setEditingIdx(null); setAdding(false); }
+  function commit() {
+    if (!draft.label?.trim()||draft.goal==="") return;
+    const u=[...kpis]; adding?u.push({...draft}):(u[editingIdx]={...draft});
+    saveAll(u); setEditingIdx(null); setAdding(false);
+  }
+  function remove(i) { if(!window.confirm("Usunąć?"))return; saveAll(kpis.filter((_,j)=>j!==i)); }
+  function moveUp(i) { if(i===0)return; const u=[...kpis];[u[i-1],u[i]]=[u[i],u[i-1]];saveAll(u); }
+
+  // Update a single goal override for a KPI at index i
+  function setGoalOverride(i, matrixKey, val) {
+    const u = kpis.map((k,j) => {
+      if (j!==i) return k;
+      const goals = {...(k.goals||{})};
+      if (val==="" || val===null) { delete goals[matrixKey]; }
+      else { goals[matrixKey] = Number(val); }
+      return {...k, goals};
+    });
+    saveAll(u);
+  }
+
+  const restName=RESTAURANTS.find(r=>r.id===restId)?.name;
+
+  return (
+    <div className="tab-content">
+      <p className="goals-hint">KPI dla: <strong>{restName}</strong></p>
+      <p className="goals-hint" style={{fontSize:"11px",marginTop:"-6px"}}>Kliknij 🎯 żeby ustawić różne cele per dzień/zmiana</p>
+      {kpis.map((k,i)=>(
+        <div key={k.key} className="kpi-config-card">
+          {editingIdx===i ? (
+            <KpiEditForm draft={draft} setDraft={setDraft} onSave={commit} onCancel={cancel} />
+          ) : (
+            <>
+              <div className="kcc-row">
+                <div className="kcc-info">
+                  <span className="kcc-label">{k.label}</span>
+                  <span className="kcc-meta">{k.lowerBetter?"≤":"≥"}{k.goal} {k.unit}
+                    <span className={`dir-badge ${k.lowerBetter?"lower":"higher"}`}>{k.lowerBetter?"↓ im niżej":"↑ im wyżej"}</span>
+                    {Object.keys(k.goals||{}).length > 0 && <span className="override-badge">{Object.keys(k.goals).length} wyjątków</span>}
+                  </span>
+                </div>
+                <div className="kcc-actions">
+                  <button className="icon-btn" onClick={()=>moveUp(i)} disabled={i===0}>↑</button>
+                  <button className="icon-btn" title="Cele per dzień/zmiana"
+                    onClick={()=>setExpandedGoals(expandedGoals===i?null:i)}>🎯</button>
+                  <button className="icon-btn" onClick={()=>startEdit(i)}>✏️</button>
+                  <button className="icon-btn danger" onClick={()=>remove(i)}>🗑</button>
+                </div>
+              </div>
+
+              {expandedGoals===i && (
+                <GoalMatrix kpi={k} kpiIdx={i} onSet={setGoalOverride} />
+              )}
+            </>
+          )}
+        </div>
+      ))}
+      {adding && <div className="kpi-config-card adding"><p className="add-title">Nowy KPI</p><KpiEditForm draft={draft} setDraft={setDraft} onSave={commit} onCancel={cancel} /></div>}
+      {!adding&&editingIdx===null && <button className="btn-add-kpi" onClick={startAdd}>+ Dodaj KPI</button>}
+      {saved && <div className="save-toast">Zapisano ✓</div>}
+    </div>
+  );
+}
+
+// Goal Matrix: per day-of-week × per shift overrides
+function GoalMatrix({ kpi, kpiIdx, onSet }) {
+  const goals = kpi.goals || {};
+  const [mode, setMode] = useState("day"); // "day" | "shift" | "matrix"
+
+  function val(key) { return goals[key] !== undefined ? goals[key] : ""; }
+
+  return (
+    <div className="goal-matrix">
+      <div className="gm-header">
+        <span className="gm-title">Cele per kontekst</span>
+        <div className="toggle-group" style={{maxWidth:"240px"}}>
+          <button className={`toggle-btn ${mode==="day"?"active":""}`} onClick={()=>setMode("day")}>Dzień</button>
+          <button className={`toggle-btn ${mode==="shift"?"active":""}`} onClick={()=>setMode("shift")}>Zmiana</button>
+          <button className={`toggle-btn ${mode==="matrix"?"active":""}`} onClick={()=>setMode("matrix")}>Dzień×Zmiana</button>
+        </div>
+      </div>
+      <div className="gm-note">Puste pole = używa domyślnego celu ({kpi.lowerBetter?"≤":"≥"}{kpi.goal} {kpi.unit})</div>
+
+      {mode==="day" && (
+        <div className="gm-grid-1col">
+          {DOW_FULL.map((label, dow) => (
+            <div key={dow} className="gm-row">
+              <span className="gm-row-label">{label}</span>
+              <input type="number" step="0.1" className="gm-input" placeholder={String(kpi.goal)}
+                value={val(dow)} onChange={e=>onSet(kpiIdx, dow, e.target.value)} />
+              <span className="gm-unit">{kpi.unit}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {mode==="shift" && (
+        <div className="gm-grid-1col">
+          {SHIFTS.map(s => (
+            <div key={s.id} className="gm-row">
+              <span className="gm-row-label">{s.label}</span>
+              <input type="number" step="0.1" className="gm-input" placeholder={String(kpi.goal)}
+                value={val(s.id)} onChange={e=>onSet(kpiIdx, s.id, e.target.value)} />
+              <span className="gm-unit">{kpi.unit}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {mode==="matrix" && (
+        <div className="gm-matrix">
+          <div className="gm-matrix-head">
+            <span></span>
+            {SHIFTS.map(s=><span key={s.id} className="gm-matrix-col">{s.label}</span>)}
+          </div>
+          {DOW_FULL.map((label, dow) => (
+            <div key={dow} className="gm-matrix-row">
+              <span className="gm-matrix-row-label">{DOW_LABELS[dow]}</span>
+              {SHIFTS.map(s => {
+                const key = `${dow}:${s.id}`;
+                return (
+                  <input key={s.id} type="number" step="0.1" className="gm-input matrix"
+                    placeholder={String(resolveGoal(kpi, `2025-01-${String(dow+5).padStart(2,"0")}`, s.id))}
+                    value={val(key)} onChange={e=>onSet(kpiIdx, key, e.target.value)} />
+                );
+              })}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function KpiEditForm({ draft, setDraft, onSave, onCancel }) {
+  const set=(f,v)=>setDraft(p=>({...p,[f]:v}));
+  const valid=draft.label?.trim()&&draft.goal!=="";
+  return (
+    <div className="kpi-edit-form">
+      <div className="edit-row">
+        <div className="field"><label>Nazwa KPI</label><input className="text-input" placeholder="np. R2P" value={draft.label||""} onChange={e=>set("label",e.target.value)} /></div>
+        <div className="field narrow"><label>Jednostka</label><input className="text-input" placeholder="sek/%" value={draft.unit||""} onChange={e=>set("unit",e.target.value)} /></div>
+      </div>
+      <div className="edit-row">
+        <div className="field"><label>Cel domyślny</label><input className="text-input" type="number" step="0.1" placeholder="np. 90" value={draft.goal} onChange={e=>set("goal",e.target.value)} /></div>
+        <div className="field"><label>Zaliczenie</label>
+          <div className="toggle-group">
+            <button className={`toggle-btn ${!draft.lowerBetter?"active":""}`} onClick={()=>set("lowerBetter",false)}>↑ Powyżej</button>
+            <button className={`toggle-btn ${draft.lowerBetter?"active":""}`} onClick={()=>set("lowerBetter",true)}>↓ Poniżej</button>
+          </div>
+        </div>
+      </div>
+      <div className="edit-actions">
+        <button className="btn-primary sm" onClick={onSave} disabled={!valid}>Zapisz</button>
+        <button className="btn-secondary sm" onClick={onCancel}>Anuluj</button>
+      </div>
+    </div>
+  );
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
+function App() {
+  const [view, setView] = useState("home");
+  const [params, setParams] = useState({});
+  const [ready, setReady] = useState(false);
+  function onNav(v, p={}) { setView(v); setParams(p); }
+
+  useEffect(() => {
+    preloadConfig(RESTAURANTS.map(r=>r.id)).then(() => setReady(true));
+  }, []);
+
+  if (!ready) return (
+    <div style={{minHeight:"100vh",background:"#181818",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:"16px",fontFamily:"sans-serif",color:"#f0f0f0"}}>
+      <div style={{width:"60px",height:"60px",background:"#FFC72C",borderRadius:"16px",display:"flex",alignItems:"center",justifyContent:"center",fontSize:"34px",fontWeight:"800",color:"#111"}}>M</div>
+      <p style={{color:"#888",fontSize:"14px"}}>Łączenie z bazą danych…</p>
+    </div>
+  );
+
+  return (
+    <div className="app">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500&display=swap');
+        *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+        :root{--red:#DA291C;--yellow:#FFC72C;--dark:#181818;--surface:#242424;--surface2:#2e2e2e;--border:rgba(255,255,255,0.09);--text:#f0f0f0;--muted:#888;--green:#2ECC71;--orange:#E67E22;--radius:14px;}
+        body{background:var(--dark);color:var(--text);font-family:'DM Sans',sans-serif;}
+        .app{min-height:100vh;background:var(--dark);display:flex;flex-direction:column;align-items:center;padding-bottom:48px;max-width:480px;margin:0 auto;}
+        .home-view{width:100%;padding:56px 24px 24px;display:flex;flex-direction:column;align-items:center;gap:16px;}
+        .logo-block{display:flex;align-items:center;gap:16px;margin-bottom:4px;}
+        .logo-m{width:60px;height:60px;background:var(--yellow);color:#111;font-family:'Syne',sans-serif;font-weight:800;font-size:34px;border-radius:16px;display:flex;align-items:center;justify-content:center;}
+        .logo-text{display:flex;flex-direction:column;}
+        .logo-title{font-family:'Syne',sans-serif;font-size:22px;font-weight:700;line-height:1;}
+        .logo-sub{font-size:13px;color:var(--muted);margin-top:3px;}
+        .home-desc{color:var(--muted);font-size:14px;text-align:center;}
+        .home-cards{width:100%;display:flex;flex-direction:column;gap:12px;margin-top:4px;}
+        .home-card{width:100%;padding:18px 20px;border-radius:var(--radius);border:none;cursor:pointer;display:flex;align-items:center;gap:16px;text-align:left;transition:transform 0.15s;}
+        .home-card:active{transform:scale(0.97);}
+        .home-card.primary{background:var(--yellow);}
+        .home-card.secondary{background:var(--surface);border:1px solid var(--border);}
+        .card-icon{font-size:26px;flex-shrink:0;}
+        .card-label{font-family:'Syne',sans-serif;font-weight:700;font-size:16px;color:#111;display:block;}
+        .home-card.secondary .card-label{color:var(--text);}
+        .card-hint{font-size:12px;color:rgba(0,0,0,0.45);display:block;margin-top:2px;}
+        .home-card.secondary .card-hint{color:var(--muted);}
+        .form-view{width:100%;padding:20px 24px;display:flex;flex-direction:column;gap:18px;}
+        .form-view.center-msg{align-items:center;text-align:center;padding-top:56px;}
+        .form-title{font-family:'Syne',sans-serif;font-weight:700;font-size:21px;}
+        .back-btn{background:none;border:none;color:var(--muted);font-size:14px;cursor:pointer;text-align:left;padding:0;}
+        .back-btn.solo{align-self:flex-start;}
+        .field{display:flex;flex-direction:column;gap:7px;}
+        .field label{font-size:11px;font-weight:500;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;}
+        .radio-group{display:flex;flex-direction:column;gap:8px;}
+        .radio-group.horiz{flex-direction:row;}
+        .radio-btn{padding:13px 16px;background:var(--surface);border:1.5px solid var(--border);border-radius:10px;color:var(--text);font-family:'DM Sans',sans-serif;font-size:15px;cursor:pointer;text-align:left;transition:all 0.15s;}
+        .radio-group.horiz .radio-btn{flex:1;text-align:center;padding:13px 8px;}
+        .radio-btn.active{background:var(--yellow);border-color:var(--yellow);color:#111;font-weight:600;}
+        .text-input{width:100%;padding:13px 16px;background:var(--surface);border:1.5px solid var(--border);border-radius:10px;color:var(--text);font-family:'DM Sans',sans-serif;font-size:15px;outline:none;transition:border-color 0.2s;}
+        .text-input:focus{border-color:var(--yellow);}
+        .text-input.sel{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%23888' stroke-width='1.5' fill='none'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 14px center;padding-right:36px;}
+        .empty-info{background:var(--surface);border:1px dashed var(--border);border-radius:10px;padding:14px;font-size:14px;color:var(--muted);}
+        .shift-badge{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;display:flex;flex-direction:column;gap:3px;}
+        .badge-rest{font-family:'Syne',sans-serif;font-weight:700;font-size:15px;}
+        .badge-info{font-size:13px;color:var(--muted);}
+        .badge-name{font-size:14px;font-weight:500;}
+        .edit-banner{background:rgba(255,199,44,0.12);border:1px solid rgba(255,199,44,0.4);border-radius:10px;padding:10px 14px;font-size:13px;color:var(--yellow);}
+        .kpi-row{padding:14px 16px;background:var(--surface);border:1.5px solid var(--border);border-radius:var(--radius);display:flex;flex-direction:column;gap:8px;transition:border-color 0.2s;}
+        .kpi-row.pass{border-color:var(--green);}
+        .kpi-row.fail{border-color:var(--red);}
+        .kpi-meta{display:flex;justify-content:space-between;align-items:center;}
+        .kpi-label{font-family:'Syne',sans-serif;font-weight:600;font-size:15px;}
+        .kpi-goal{font-size:12px;color:var(--muted);}
+        .kpi-input-wrap{display:flex;align-items:center;gap:10px;}
+        .kpi-input{flex:1;padding:10px 14px;background:var(--dark);border:1.5px solid var(--border);border-radius:8px;color:var(--text);font-size:20px;font-family:'Syne',sans-serif;font-weight:700;outline:none;}
+        .kpi-input:focus{border-color:var(--yellow);}
+        .kpi-pill{width:36px;height:36px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:700;flex-shrink:0;}
+        .kpi-pill.ok{background:rgba(46,204,113,0.2);color:var(--green);}
+        .kpi-pill.nok{background:rgba(218,41,28,0.2);color:var(--red);}
+        .save-error{color:var(--red);font-size:13px;padding:10px;background:rgba(218,41,28,0.1);border-radius:8px;}
+        .btn-primary{width:100%;padding:16px;background:var(--yellow);color:#111;border:none;border-radius:var(--radius);font-family:'Syne',sans-serif;font-weight:700;font-size:16px;cursor:pointer;transition:opacity 0.2s,transform 0.15s;}
+        .btn-primary:disabled{opacity:0.35;cursor:not-allowed;}
+        .btn-primary:not(:disabled):active{transform:scale(0.98);}
+        .btn-primary.sm{padding:12px;font-size:14px;}
+        .btn-secondary{width:100%;padding:14px;background:transparent;color:var(--text);border:1.5px solid var(--border);border-radius:var(--radius);font-family:'Syne',sans-serif;font-weight:600;font-size:15px;cursor:pointer;}
+        .btn-secondary.sm{padding:12px;font-size:14px;}
+        .btn-ghost{background:transparent;border:none;color:var(--muted);font-size:14px;cursor:pointer;padding:8px 0;}
+        .btn-ghost.sm{font-size:13px;}
+        .mt{margin-top:4px;}
+        .result-view{width:100%;padding:40px 24px 24px;display:flex;flex-direction:column;align-items:center;gap:18px;}
+        .result-circle{width:120px;height:120px;border-radius:50%;display:flex;flex-direction:column;align-items:center;justify-content:center;border:4px solid;}
+        .result-circle.green{border-color:var(--green);background:rgba(46,204,113,0.1);}
+        .result-circle.yellow{border-color:var(--orange);background:rgba(230,126,18,0.1);}
+        .result-circle.red{border-color:var(--red);background:rgba(218,41,28,0.1);}
+        .rc-num{font-family:'Syne',sans-serif;font-weight:800;font-size:32px;line-height:1;}
+        .rc-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.1em;}
+        .result-heading{font-family:'Syne',sans-serif;font-weight:700;font-size:22px;text-align:center;}
+        .result-kpis{width:100%;display:flex;flex-direction:column;gap:8px;}
+        .result-row{display:flex;align-items:center;gap:10px;padding:12px 14px;background:var(--surface);border-radius:10px;border-left:3px solid;}
+        .result-row.pass{border-color:var(--green);}
+        .result-row.fail{border-color:var(--red);}
+        .result-row span:first-child{flex:1;font-size:14px;}
+        .result-row span:nth-child(2){font-family:'Syne',sans-serif;font-weight:700;font-size:15px;}
+        .pill{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700;}
+        .pill.ok{background:rgba(46,204,113,0.2);color:var(--green);}
+        .pill.nok{background:rgba(218,41,28,0.2);color:var(--red);}
+        .admin-view{width:100%;padding:20px 24px;display:flex;flex-direction:column;gap:14px;}
+        .admin-header{display:flex;align-items:center;justify-content:space-between;}
+        .admin-header h2{font-family:'Syne',sans-serif;font-weight:700;font-size:20px;}
+        .admin-controls{display:flex;flex-direction:column;gap:10px;}
+        .seg-ctrl{display:flex;gap:6px;}
+        .seg-btn{flex:1;padding:10px 4px;background:var(--surface);border:1.5px solid var(--border);border-radius:8px;color:var(--muted);font-size:12px;cursor:pointer;transition:all 0.15s;}
+        .seg-btn.active{background:var(--yellow);border-color:var(--yellow);color:#111;font-weight:700;}
+        .month-sel{padding:10px 14px;background:var(--surface);border:1.5px solid var(--border);border-radius:8px;color:var(--text);font-size:14px;width:100%;}
+        .tab-bar{display:flex;border-bottom:1px solid var(--border);}
+        .tab{flex:1;padding:12px 4px;background:transparent;border:none;color:var(--muted);font-size:13px;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:all 0.2s;}
+        .tab.active{color:var(--yellow);border-bottom-color:var(--yellow);font-weight:600;}
+        .tab-content{display:flex;flex-direction:column;gap:12px;padding-top:4px;}
+        .manager-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px;display:flex;flex-direction:column;gap:12px;transition:border-color 0.15s;}
+        .manager-card:hover{border-color:rgba(255,199,44,0.3);}
+        .manager-card.inactive{opacity:0.5;}
+        .mc-top{display:flex;align-items:center;justify-content:space-between;}
+        .mc-name{font-family:'Syne',sans-serif;font-weight:700;font-size:17px;}
+        .mc-name.muted{color:var(--muted);}
+        .bonus-chip{padding:5px 12px;border-radius:20px;font-size:13px;font-weight:700;}
+        .bonus-chip.yes{background:rgba(46,204,113,0.15);color:var(--green);}
+        .bonus-chip.no{background:rgba(218,41,28,0.1);color:var(--red);}
+        .mc-stats{display:flex;gap:8px;}
+        .mc-stat{flex:1;background:var(--surface2);border-radius:10px;padding:10px 8px;display:flex;flex-direction:column;align-items:center;gap:2px;}
+        .mcs-val{font-family:'Syne',sans-serif;font-weight:800;font-size:18px;color:var(--yellow);}
+        .mcs-val.green-txt{color:var(--green);}
+        .mcs-val.red-txt{color:var(--orange);}
+        .mcs-lbl{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;}
+        .mc-bar-wrap{height:8px;background:var(--surface2);border-radius:4px;overflow:hidden;position:relative;}
+        .mc-bar{height:100%;border-radius:4px;transition:width 0.5s;}
+        .mc-bar-threshold{position:absolute;top:0;left:80%;width:2px;height:100%;background:rgba(255,255,255,0.25);}
+        .mc-actions{display:flex;gap:8px;justify-content:flex-end;}
+        .add-manager-form{display:flex;flex-direction:column;gap:10px;padding:16px;background:var(--surface);border:1.5px solid var(--yellow);border-radius:var(--radius);}
+        .mgr-detail-header{display:flex;align-items:center;justify-content:space-between;}
+        .mgr-detail-name{font-family:'Syne',sans-serif;font-weight:800;font-size:22px;}
+        .detail-shift-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;display:flex;flex-direction:column;gap:10px;}
+        .dsc-header{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;}
+        .dsc-title{display:flex;flex-direction:column;gap:2px;}
+        .dsc-date{font-family:'Syne',sans-serif;font-weight:700;font-size:15px;}
+        .dsc-shift{font-size:13px;color:var(--muted);}
+        .dsc-edited{font-size:11px;color:var(--orange);background:rgba(230,126,18,0.12);padding:1px 6px;border-radius:4px;align-self:flex-start;}
+        .dsc-score-row{display:flex;align-items:center;gap:6px;flex-shrink:0;}
+        .kpi-table{display:flex;flex-direction:column;gap:0;border-radius:8px;overflow:hidden;border:1px solid var(--border);}
+        .kpi-table-head{display:grid;grid-template-columns:1fr 80px 60px 28px;padding:7px 10px;background:var(--surface2);font-size:10px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;}
+        .kpi-table-row{display:grid;grid-template-columns:1fr 80px 60px 28px;padding:9px 10px;border-top:1px solid var(--border);align-items:center;}
+        .kpi-table-row:nth-child(even){background:rgba(255,255,255,0.02);}
+        .ktr-label{font-size:13px;font-weight:500;}
+        .ktr-value{font-family:'Syne',sans-serif;font-weight:700;font-size:14px;}
+        .ktr-goal{font-size:12px;color:var(--muted);}
+        .ktr-pill{width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;}
+        .ktr-pill.ok{background:rgba(46,204,113,0.2);color:var(--green);}
+        .ktr-pill.nok{background:rgba(218,41,28,0.2);color:var(--red);}
+        .shift-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;display:flex;flex-direction:column;gap:8px;}
+        .sc-top{display:flex;justify-content:space-between;align-items:center;}
+        .sc-date{font-size:13px;color:var(--muted);}
+        .sc-score{font-family:'Syne',sans-serif;font-weight:800;font-size:15px;padding:3px 10px;border-radius:20px;}
+        .sc-score.all{background:rgba(46,204,113,0.2);color:var(--green);}
+        .sc-score.mid{background:rgba(230,126,18,0.2);color:var(--orange);}
+        .sc-score.low{background:rgba(218,41,28,0.2);color:var(--red);}
+        .sc-name{font-size:14px;font-weight:500;}
+        .sc-kpis{display:flex;flex-wrap:wrap;gap:6px;}
+        .sc-kpi-pill{font-size:11px;padding:4px 8px;border-radius:6px;}
+        .sc-kpi-pill.ok{background:rgba(46,204,113,0.15);color:var(--green);}
+        .sc-kpi-pill.nok{background:rgba(218,41,28,0.15);color:var(--red);}
+        .goals-hint{font-size:13px;color:var(--muted);}
+        .kpi-config-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;}
+        .kpi-config-card.adding{border-color:var(--yellow);}
+        .add-title{font-family:'Syne',sans-serif;font-weight:700;font-size:14px;color:var(--yellow);margin-bottom:10px;}
+        .kcc-row{display:flex;align-items:center;gap:12px;}
+        .kcc-info{flex:1;display:flex;flex-direction:column;gap:4px;}
+        .kcc-label{font-family:'Syne',sans-serif;font-weight:700;font-size:15px;}
+        .kcc-meta{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:8px;}
+        .dir-badge{padding:2px 7px;border-radius:6px;font-size:11px;font-weight:600;}
+        .dir-badge.lower{background:rgba(218,41,28,0.15);color:#e88;}
+        .dir-badge.higher{background:rgba(46,204,113,0.15);color:var(--green);}
+        .kcc-actions{display:flex;gap:6px;}
+        .icon-btn{background:var(--surface2);border:1px solid var(--border);border-radius:8px;width:34px;height:34px;font-size:15px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background 0.15s;}
+        .icon-btn.sm{width:30px;height:30px;font-size:13px;}
+        .icon-btn:hover{background:rgba(255,255,255,0.08);}
+        .icon-btn:disabled{opacity:0.3;cursor:not-allowed;}
+        .icon-btn.danger:hover{background:rgba(218,41,28,0.2);}
+        .kpi-edit-form{display:flex;flex-direction:column;gap:12px;}
+        .edit-row{display:flex;gap:10px;}
+        .edit-row .field{flex:1;}
+        .edit-row .field.narrow{flex:0 0 90px;}
+        .toggle-group{display:flex;gap:6px;}
+        .toggle-btn{flex:1;padding:10px 6px;background:var(--surface2);border:1.5px solid var(--border);border-radius:8px;color:var(--muted);font-size:12px;cursor:pointer;transition:all 0.15s;}
+        .toggle-btn.active{background:var(--yellow);border-color:var(--yellow);color:#111;font-weight:700;}
+        .edit-actions{display:flex;gap:10px;}
+        .edit-actions .btn-primary,.edit-actions .btn-secondary{flex:1;}
+        .btn-add-kpi{width:100%;padding:14px;background:transparent;border:1.5px dashed rgba(255,199,44,0.4);border-radius:var(--radius);color:var(--yellow);font-family:'Syne',sans-serif;font-weight:700;font-size:15px;cursor:pointer;transition:all 0.2s;}
+        .btn-add-kpi:hover{background:rgba(255,199,44,0.06);}
+        .save-toast{text-align:center;padding:12px;background:rgba(46,204,113,0.15);border:1px solid var(--green);border-radius:10px;color:var(--green);font-weight:600;font-size:14px;}
+        .section-title{font-family:'Syne',sans-serif;font-weight:700;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.07em;}
+        .missing-block{background:rgba(218,41,28,0.08);border:1.5px solid rgba(218,41,28,0.35);border-radius:var(--radius);padding:14px 16px;display:flex;flex-direction:column;gap:10px;}
+        .missing-header{display:flex;align-items:center;gap:12px;}
+        .missing-icon{font-size:24px;flex-shrink:0;}
+        .missing-title{font-family:'Syne',sans-serif;font-weight:700;font-size:15px;color:var(--red);}
+        .missing-sub{font-size:12px;color:var(--muted);margin-top:2px;}
+        .missing-list{display:flex;flex-direction:column;gap:4px;max-height:200px;overflow-y:auto;}
+        .missing-row{display:flex;align-items:center;justify-content:space-between;padding:5px 8px;background:rgba(218,41,28,0.06);border-radius:6px;}
+        .missing-date{font-size:13px;font-weight:500;}
+        .missing-shift-tag{font-size:11px;font-weight:700;padding:2px 8px;border-radius:6px;background:rgba(218,41,28,0.15);color:var(--red);}
+        .missing-more{font-size:12px;color:var(--muted);text-align:center;padding:4px;}
+        .kpi-breakdown{display:flex;flex-direction:column;gap:10px;}
+        .kpi-bd-row{display:flex;flex-direction:column;gap:4px;}
+        .kpi-bd-top{display:flex;justify-content:space-between;align-items:center;}
+        .kpi-bd-label{font-size:13px;font-weight:500;}
+        .kpi-bd-right{display:flex;align-items:center;gap:10px;}
+        .kpi-bd-avg{font-size:12px;color:var(--muted);}
+        .kpi-bd-pct{font-family:'Syne',sans-serif;font-weight:800;font-size:15px;}
+        .kpi-bd-bar-wrap{height:7px;background:var(--surface2);border-radius:4px;overflow:hidden;position:relative;}
+        .kpi-bd-bar{height:100%;border-radius:4px;transition:width 0.5s;}
+        .kpi-bd-threshold{position:absolute;top:0;left:80%;width:2px;height:100%;background:rgba(255,255,255,0.2);}
+        .kpi-bd-count{font-size:11px;color:var(--muted);}
+        .override-badge{padding:2px 7px;border-radius:6px;font-size:10px;font-weight:700;background:rgba(255,199,44,0.15);color:var(--yellow);}
+        .goal-matrix{background:var(--surface2);border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:10px;margin-top:4px;}
+        .gm-header{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;}
+        .gm-title{font-family:'Syne',sans-serif;font-weight:700;font-size:13px;color:var(--yellow);}
+        .gm-note{font-size:11px;color:var(--muted);}
+        .gm-grid-1col{display:flex;flex-direction:column;gap:6px;}
+        .gm-row{display:flex;align-items:center;gap:8px;}
+        .gm-row-label{flex:1;font-size:13px;font-weight:500;}
+        .gm-input{width:72px;padding:7px 10px;background:var(--dark);border:1.5px solid var(--border);border-radius:8px;color:var(--text);font-size:14px;font-family:'Syne',sans-serif;font-weight:700;outline:none;text-align:center;}
+        .gm-input:focus{border-color:var(--yellow);}
+        .gm-input.matrix{width:56px;padding:6px 4px;font-size:13px;}
+        .gm-unit{font-size:11px;color:var(--muted);min-width:28px;}
+        .gm-matrix{display:flex;flex-direction:column;gap:4px;overflow-x:auto;}
+        .gm-matrix-head{display:flex;align-items:center;gap:6px;padding-bottom:2px;}
+        .gm-matrix-head span:first-child{min-width:44px;}
+        .gm-matrix-col{flex:1;font-size:11px;color:var(--muted);text-align:center;min-width:56px;}
+        .gm-matrix-row{display:flex;align-items:center;gap:6px;}
+        .gm-matrix-row-label{min-width:44px;font-size:12px;font-weight:500;color:var(--muted);}
+        .pin-input{text-align:center;font-size:28px;letter-spacing:0.3em;max-width:200px;}
+        .error-msg{color:var(--red);font-size:13px;}
+        .empty{text-align:center;color:var(--muted);padding:32px;font-size:14px;}
+        .warn-icon{font-size:48px;}
+        .center-msg h2{font-family:'Syne',sans-serif;font-weight:700;font-size:22px;}
+        .center-msg p{color:var(--muted);font-size:14px;}
+        .center-msg .sub{font-size:12px;}
+      `}</style>
+      {view==="home"            && <HomeView onNav={onNav} />}
+      {view==="shift-select"    && <ShiftSelectView onNav={onNav} />}
+      {view==="kpi-form"        && <KpiFormView params={params} onNav={onNav} />}
+      {view==="result"          && <ResultView params={params} onNav={onNav} />}
+      {view==="admin-login"     && <AdminLoginView onNav={onNav} />}
+      {view==="admin-dashboard" && <AdminDashboard onNav={onNav} />}
+    </div>
+  );
+}
+
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
