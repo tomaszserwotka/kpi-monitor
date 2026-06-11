@@ -7,34 +7,12 @@
   <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: #181818; }
-    #root { min-height: 100vh; }
-    .loading-screen {
-      min-height: 100vh; background: #181818; display: flex;
-      flex-direction: column; align-items: center; justify-content: center;
-      gap: 16px; font-family: sans-serif;
-    }
-    .loading-m {
-      width: 60px; height: 60px; background: #FFC72C; border-radius: 16px;
-      display: flex; align-items: center; justify-content: center;
-      font-size: 34px; font-weight: 800; color: #111;
-    }
-    .loading-txt { color: #888; font-size: 14px; }
-  </style>
+  <style>* { box-sizing: border-box; margin: 0; padding: 0; } body { background: #181818; } #root { min-height: 100vh; }</style>
 </head>
 <body>
-  <div id="root">
-    <div class="loading-screen">
-      <div class="loading-m">M</div>
-      <p class="loading-txt">Ładowanie…</p>
-    </div>
-  </div>
-
+  <div id="root"></div>
   <script type="text/babel">
     const { useState, useEffect } = React;
-
 
 const RESTAURANTS = [
   { id: "268", name: "Galeria Bałtycka", kr: "Adrian" },
@@ -82,134 +60,65 @@ function getMonthKey(d) { return d.slice(0, 7); }
 function formatDate(d) { if (!d) return ""; const [y,m,day] = d.split("-"); return `${day}.${m}.${y}`; }
 function uid() { return Math.random().toString(36).slice(2, 8); }
 
-// ── Storage: JSONP → fetch fallback → localStorage ────────────────────────────
-const GAS_URL = "https://script.google.com/macros/s/AKfycbzkns79loHY-VD4d1lXavnw9q3FrXx1DtgNqITe5TXEVgIbJgkNtHuR7diHQKga4aNSXQ/exec";
+// ── Supabase storage ──────────────────────────────────────────────────────────
+const SB_URL = "https://whnddsflqekdonysrsoz.supabase.co";
+const SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndobmRkc2ZscWVrZG9ueXNyc296Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODExOTA0MTIsImV4cCI6MjA5Njc2NjQxMn0.r_xLM775pH1IzDpuvxGBtmjSstUsmqtzKVxnTsYaT5o";
+const SB_H = {
+  "apikey": SB_KEY,
+  "Authorization": `Bearer ${SB_KEY}`,
+  "Content-Type": "application/json",
+  "Prefer": "resolution=merge-duplicates"
+};
 const _cache = {};
 const _syncCache = {};
 const LS_PFX = "kpim_";
-let _cbIdx = 0;
-let _gasMode = "jsonp"; // "jsonp" | "fetch" | "local"
-
-// localStorage helpers (always available as fallback)
-function _lsRead(key) { try { const r = localStorage.getItem(LS_PFX+key); return r ? JSON.parse(r) : null; } catch { return null; } }
-function _lsWrite(key, val) { try { localStorage.setItem(LS_PFX+key, JSON.stringify(val)); return true; } catch { return false; } }
-function _lsRemove(key) { try { localStorage.removeItem(LS_PFX+key); } catch {} }
-
-// JSONP — works when CSP allows script injection from GAS domain
-function _gasJsonp(params) {
-  return new Promise((resolve) => {
-    const cbName = `_gasCb${_cbIdx++}`;
-    const timer = setTimeout(() => {
-      delete window[cbName];
-      try { if (s.parentNode) s.parentNode.removeChild(s); } catch {}
-      resolve({ error: "timeout" });
-    }, 10000);
-    window[cbName] = (data) => {
-      clearTimeout(timer);
-      delete window[cbName];
-      try { if (s.parentNode) s.parentNode.removeChild(s); } catch {}
-      resolve(data);
-    };
-    const qs = Object.entries({ ...params, callback: cbName })
-      .map(([k,v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");
-    const s = document.createElement("script");
-    s.src = `${GAS_URL}?${qs}`;
-    s.onerror = () => {
-      clearTimeout(timer);
-      delete window[cbName];
-      resolve({ error: "csp_blocked" });
-    };
-    document.head.appendChild(s);
-  });
-}
-
-// fetch with no-cors for writes (fire-and-forget), regular fetch for reads
-async function _gasFetch(params) {
-  const qs = Object.entries(params).map(([k,v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");
-  const url = `${GAS_URL}?${qs}`;
-  const r = await fetch(url, { mode: "cors" });
-  return await r.json();
-}
-
-// Auto-detect best working mode on first call
-let _modeDetected = false;
-async function _gasCall(params) {
-  if (!_modeDetected) {
-    // Try JSONP first
-    const test = await _gasJsonp({ action: "ping" });
-    if (test.ok) {
-      _gasMode = "jsonp";
-      window._gasTestResult = "✓ JSONP działa";
-    } else {
-      // Try fetch
-      try {
-        const test2 = await _gasFetch({ action: "ping" });
-        if (test2.ok) { _gasMode = "fetch"; window._gasTestResult = "✓ fetch działa"; }
-        else throw new Error("no ok");
-      } catch {
-        _gasMode = "local";
-        window._gasTestResult = `✗ GAS niedostępny (${test.error}) — tryb lokalny`;
-      }
-    }
-    _modeDetected = true;
-    console.log("GAS mode:", _gasMode, window._gasTestResult);
-  }
-  if (_gasMode === "jsonp") return _gasJsonp(params);
-  if (_gasMode === "fetch") return _gasFetch(params);
-  return { error: "local_only" };
-}
+function _lsR(k) { try { const r=localStorage.getItem(LS_PFX+k); return r?JSON.parse(r):null; } catch { return null; } }
+function _lsW(k,v) { try { localStorage.setItem(LS_PFX+k,JSON.stringify(v)); } catch {} }
+function _lsDel(k) { try { localStorage.removeItem(LS_PFX+k); } catch {} }
 
 async function lsGet(key) {
   if (_cache[key] !== undefined) return _cache[key];
-  // Always read from localStorage immediately for speed
-  const local = _lsRead(key);
-  if (local !== null) { _cache[key] = local; _syncCache[key] = local; }
-  // Then try GAS for authoritative value
+  const local = _lsR(key);
+  if (local !== null) { _cache[key]=local; _syncCache[key]=local; }
   try {
-    const d = await _gasCall({ action: "get", key });
-    if (d && d.value !== null && d.value !== undefined) {
-      const val = JSON.parse(d.value);
-      _cache[key] = val;
-      _syncCache[key] = val;
-      _lsWrite(key, val); // keep local in sync
+    const r = await fetch(`${SB_URL}/rest/v1/kv?key=eq.${encodeURIComponent(key)}&select=value`, { headers: SB_H });
+    const rows = await r.json();
+    if (rows?.length > 0 && rows[0].value) {
+      const val = JSON.parse(rows[0].value);
+      _cache[key]=val; _syncCache[key]=val; _lsW(key,val);
       return val;
     }
   } catch {}
   return local;
 }
-
 async function lsSet(key, val) {
-  _cache[key] = val;
-  _syncCache[key] = val;
-  _lsWrite(key, val); // always write locally first
+  _cache[key]=val; _syncCache[key]=val; _lsW(key,val);
   try {
-    const b64 = btoa(unescape(encodeURIComponent(JSON.stringify(val))));
-    const d = await _gasCall({ action: "set", key, value: b64, encoding: "base64" });
-    return true; // return true even if GAS fails — data is in localStorage
-  } catch { return true; } // localStorage write succeeded
+    await fetch(`${SB_URL}/rest/v1/kv`, {
+      method: "POST", headers: SB_H,
+      body: JSON.stringify({ key, value: JSON.stringify(val), updated_at: new Date().toISOString() })
+    });
+  } catch {}
+  return true;
 }
-
 async function lsDel(key) {
-  delete _cache[key];
-  delete _syncCache[key];
-  _lsRemove(key);
-  try { await _gasCall({ action: "delete", key }); } catch {}
+  delete _cache[key]; delete _syncCache[key]; _lsDel(key);
+  try { await fetch(`${SB_URL}/rest/v1/kv?key=eq.${encodeURIComponent(key)}`, { method:"DELETE", headers:SB_H }); } catch {}
 }
+function lsGetSync(key) { return _syncCache[key] ?? _lsR(key) ?? null; }
+function lsSetSync(key, val) { _syncCache[key]=val; _cache[key]=val; _lsW(key,val); lsSet(key,val); }
 
-function lsGetSync(key) { return _syncCache[key] ?? _lsRead(key) ?? null; }
-function lsSetSync(key, val) { _syncCache[key] = val; _cache[key] = val; _lsWrite(key, val); lsSet(key, val); }
+function lsSetSync(key, val) { _syncCache[key] = val; _cache[key] = val; lsSet(key, val); }
 
 async function preloadConfig(restIds) {
-  // Load from localStorage immediately (sync)
   restIds.forEach(id => {
-    const m = _lsRead(`managers:${id}`); if(m) _syncCache[`managers:${id}`] = m;
-    const k = _lsRead(`kpis:${id}`); if(k) _syncCache[`kpis:${id}`] = k;
+    const m = _lsR(`managers:${id}`); if(m) _syncCache[`managers:${id}`] = m;
+    const k = _lsR(`kpis:${id}`); if(k) _syncCache[`kpis:${id}`] = k;
   });
-  // Then refresh from GAS in background (don't block UI)
   Promise.all(restIds.flatMap(id => [
     lsGet(`managers:${id}`).then(v => { if(v) _syncCache[`managers:${id}`] = v; }),
     lsGet(`kpis:${id}`).then(v => { if(v) _syncCache[`kpis:${id}`] = v; }),
-  ])).catch(() => {});
+  ])).catch(()=>{});
 }
 
 function getManagers(restId) { return lsGetSync(`managers:${restId}`) || []; }
@@ -244,7 +153,6 @@ function HomeView({ onNav }) {
         </div>
       </div>
       <p className="home-desc">Wybierz swoją rolę, aby kontynuować.</p>
-      {window._gasTestResult && <div style={{fontSize:"11px",padding:"6px 10px",background:"rgba(255,199,44,0.1)",border:"1px solid rgba(255,199,44,0.3)",borderRadius:"8px",color:"#FFC72C",wordBreak:"break-all",marginTop:"-8px"}}>{window._gasTestResult}</div>}
       <div className="home-cards">
         <button className="home-card primary" onClick={() => onNav("shift-select")}>
           <span className="card-icon">📋</span>
@@ -374,8 +282,7 @@ function KpiFormView({ params, onNav }) {
     const entry = `${date}|${shift}`;
     if (!idx.includes(entry)) { idx.push(entry); await lsSet(idxKey, idx); }
     setSaving(false);
-    // ok1 is always true now (localStorage fallback)
-    // if (!ok1) { setSaveError("..."); return; }
+    // lsSet always returns true
     setDone(true);
     setTimeout(() => {
       if (editMode) onNav("admin-dashboard");
@@ -1046,7 +953,6 @@ function App() {
   function onNav(v, p={}) { setView(v); setParams(p); }
 
   useEffect(() => {
-    // Start immediately — preload runs in background
     preloadConfig(RESTAURANTS.map(r=>r.id));
     setReady(true);
   }, []);
@@ -1293,9 +1199,7 @@ function App() {
   );
 }
 
-
-    const root = ReactDOM.createRoot(document.getElementById('root'));
-    root.render(<App />);
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
   </script>
 </body>
 </html>
