@@ -48,7 +48,7 @@ function resolveGoal(kpi, date, shiftId) {
   return Number(kpi.goal);
 }
 const PASS_THRESHOLD = 0.8;
-const ADMIN_PIN = "1234";
+const ADMIN_PIN = "1012";
 
 function checkKpiRaw(lowerBetter, goal, value) {
   if (value === "" || value === undefined || value === null) return null;
@@ -388,11 +388,28 @@ function AdminDashboard({ onNav }) {
   const [selMonth, setSelMonth] = useState(today().slice(0,7));
   const [detailMgr, setDetailMgr] = useState(null); // manager object for detail view
 
-  const months = [];
-  for(let i=0;i<6;i++){
-    const d=new Date(); d.setMonth(d.getMonth()-i);
-    months.push({value:d.toISOString().slice(0,7), label:d.toLocaleDateString("pl-PL",{month:"long",year:"numeric"})});
-  }
+  const months = (() => {
+    const result = [];
+    const now = new Date();
+    const currentYear = now.getFullYear();
+    // All months of current year, sorted newest first
+    for(let m = 11; m >= 0; m--) {
+      const d = new Date(currentYear, m, 1);
+      result.push({
+        value: d.toISOString().slice(0,7),
+        label: d.toLocaleDateString("pl-PL", {month:"long", year:"numeric"})
+      });
+    }
+    // Also add previous year's last 3 months for history
+    for(let m = 11; m >= 9; m--) {
+      const d = new Date(currentYear - 1, m, 1);
+      result.push({
+        value: d.toISOString().slice(0,7),
+        label: d.toLocaleDateString("pl-PL", {month:"long", year:"numeric"})
+      });
+    }
+    return result;
+  })();
 
   if (detailMgr) {
     return <ManagerDetailView
@@ -569,6 +586,27 @@ function ManagerDetailView({ manager, restId, monthKey, onBack, onEdit }) {
   );
 }
 
+// ── Missing List Component ───────────────────────────────────────────────────
+function MissingList({ missing }) {
+  const [expanded, setExpanded] = React.useState(false);
+  const shown = expanded ? missing : missing.slice(0, 10);
+  return (
+    <div className="missing-list">
+      {shown.map((item, i) => (
+        <div key={i} className="missing-row">
+          <span className="missing-date">{formatDate(item.date)}</span>
+          <span className="missing-shift-tag">{item.shift.label}</span>
+        </div>
+      ))}
+      {missing.length > 10 && (
+        <button className="missing-toggle" onClick={() => setExpanded(e => !e)}>
+          {expanded ? "▲ Zwiń" : `▼ Pokaż wszystkie (${missing.length})`}
+        </button>
+      )}
+    </div>
+  );
+}
+
 // ── Managers Tab ──────────────────────────────────────────────────────────────
 function ManagersTab({ restId, monthKey, onDetail }) {
   const [managers, setManagers] = useState([]);
@@ -631,15 +669,7 @@ function ManagersTab({ restId, monthKey, onDetail }) {
               <div className="missing-sub">Zmiany bez wpisanych wyników KPI</div>
             </div>
           </div>
-          <div className="missing-list">
-            {missing.slice(0, 12).map((item, i) => (
-              <div key={i} className="missing-row">
-                <span className="missing-date">{formatDate(item.date)}</span>
-                <span className="missing-shift-tag">{item.shift.label}</span>
-              </div>
-            ))}
-            {missing.length > 12 && <div className="missing-more">+ {missing.length - 12} więcej</div>}
-          </div>
+          <MissingList missing={missing} />
         </div>
       )}
       {active.length === 0 && !adding && <div className="empty">Brak KZ. Dodaj poniżej.</div>}
@@ -1151,6 +1181,8 @@ function App() {
         .missing-date{font-size:13px;font-weight:500;}
         .missing-shift-tag{font-size:11px;font-weight:700;padding:2px 8px;border-radius:6px;background:rgba(218,41,28,0.15);color:var(--red);}
         .missing-more{font-size:12px;color:var(--muted);text-align:center;padding:4px;}
+        .missing-toggle{width:100%;padding:8px;background:transparent;border:1px solid rgba(218,41,28,0.3);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer;margin-top:4px;}
+        .missing-toggle:hover{background:rgba(218,41,28,0.08);}
         .kpi-breakdown{display:flex;flex-direction:column;gap:10px;}
         .kpi-bd-row{display:flex;flex-direction:column;gap:4px;}
         .kpi-bd-top{display:flex;justify-content:space-between;align-items:center;}
