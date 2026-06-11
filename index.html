@@ -115,8 +115,6 @@ async function lsDel(key) {
 function lsGetSync(key) { return _syncCache[key] ?? _lsR(key) ?? null; }
 function lsSetSync(key, val) { _syncCache[key]=val; _cache[key]=val; _lsW(key,val); lsSet(key,val); }
 
-function lsSetSync(key, val) { _syncCache[key] = val; _cache[key] = val; lsSet(key, val); }
-
 async function preloadConfig(restIds) {
   restIds.forEach(id => {
     const m = _lsR(`managers:${id}`); if(m) _syncCache[`managers:${id}`] = m;
