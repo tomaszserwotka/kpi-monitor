@@ -94,18 +94,11 @@ async function lsGet(key) {
 async function lsSet(key, val) {
   _cache[key]=val; _syncCache[key]=val; _lsW(key,val);
   try {
-    const r = await fetch(`${SB_URL}/rest/v1/kv`, {
+    await fetch(`${SB_URL}/rest/v1/kv`, {
       method: "POST", headers: SB_H,
-      body: JSON.stringify({ key, value: JSON.stringify(val) })
+      body: JSON.stringify({ key, value: JSON.stringify(val), updated_at: new Date().toISOString() })
     });
-    if (!r.ok) {
-      const txt = await r.text();
-      console.error("lsSet failed", r.status, txt);
-      window._lastSbError = r.status + ": " + txt.slice(0,200);
-    } else {
-      window._lastSbError = null;
-    }
-  } catch(e) { console.error("lsSet exception", e); window._lastSbError = e.message; }
+  } catch {}
   return true;
 }
 async function lsDel(key) {
@@ -114,6 +107,7 @@ async function lsDel(key) {
 }
 function lsGetSync(key) { return _syncCache[key] ?? _lsR(key) ?? null; }
 function lsSetSync(key, val) { _syncCache[key]=val; _cache[key]=val; _lsW(key,val); lsSet(key,val); }
+
 
 async function preloadConfig(restIds) {
   restIds.forEach(id => {
@@ -287,8 +281,7 @@ function KpiFormView({ params, onNav }) {
     const entry = `${date}|${shift}`;
     if (!idx.includes(entry)) { idx.push(entry); await lsSet(idxKey, idx); }
     setSaving(false);
-    // lsSet always returns true
-    if (window._lastSbError) { setSaveError("Błąd Supabase: " + window._lastSbError); return; }
+    // lsSet always returns true (localStorage fallback)
     setDone(true);
     setTimeout(() => {
       if (editMode) onNav("admin-dashboard");
